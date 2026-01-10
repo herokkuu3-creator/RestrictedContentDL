@@ -1,9 +1,7 @@
 from os import getenv
 from time import time
 
-# No imports of 'dotenv' here
-
-# Validation checks strictly against the environment
+# Validate strictly from Environment
 if not getenv("BOT_TOKEN") or not getenv("BOT_TOKEN").count(":") == 1:
     print("Error: BOT_TOKEN must be set in environment and in format '123456:abcdefghijklmnopqrstuvwxyz'")
     exit(1)
@@ -15,6 +13,8 @@ if (
     print("Error: SESSION_STRING must be set in environment with a valid string")
     exit(1)
 
+
+# Pyrogram setup
 class PyroConf(object):
     API_ID = int(getenv("API_ID", "6"))
     API_HASH = getenv("API_HASH", "eb06d4abfb49dc3eeb1aeb98ae0f581e")
