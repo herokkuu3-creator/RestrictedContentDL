@@ -3,3 +3,4 @@ TgCrypto
 Pyleaves
 psutil
 pillow
+aiohttp
