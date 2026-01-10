@@ -60,6 +60,7 @@ user = Client(
 
 RUNNING_TASKS = set()
 download_semaphore = None
+BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...', 'data': ...}}
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -77,6 +78,8 @@ async def start(_, message: Message):
         "I can grab photos, videos, audio, and documents from any Telegram post.\n"
         "Just send me a link (paste it directly or use `/dl <link>`),\n"
         "or reply to a message with `/dl`.\n\n"
+        "**New Feature:**\n"
+        "Use `/batch` to clone/download multiple messages easily!\n\n"
         "ℹ️ Use `/help` to view all commands and examples.\n"
         "🔒 Make sure the user client is part of the chat.\n\n"
         "Ready? Send me a Telegram post link!"
@@ -92,23 +95,19 @@ async def start(_, message: Message):
 async def help_command(_, message: Message):
     help_text = (
         "💡 **Media Downloader Bot Help**\n\n"
-        "➤ **Download Media**\n"
-        "   – Send `/dl <post_URL>` **or** just paste a Telegram post link to fetch photos, videos, audio, or documents.\n\n"
-        "➤ **Batch Download**\n"
-        "   – Send `/bdl start_link end_link` to grab a series of posts in one go.\n"
-        "     💡 Example: `/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`\n"
-        "**It will download all posts from ID 100 to 120.**\n\n"
+        "➤ **Single Download**\n"
+        "   – Just paste a link or use `/dl <link>`.\n\n"
+        "➤ **Batch Process (Simple)**\n"
+        "   1. Send `/batch`\n"
+        "   2. Send the **Start Link**\n"
+        "   3. Send the **Number of Messages** (e.g., 100)\n"
+        "   The bot will calculate the range and process them.\n\n"
         "➤ **Requirements**\n"
         "   – Make sure the user client is part of the chat.\n\n"
-        "➤ **If the bot hangs**\n"
-        "   – Send `/killall` to cancel any pending downloads.\n\n"
-        "➤ **Logs**\n"
-        "   – Send `/logs` to download the bot’s logs file.\n\n"
-        "➤ **Stats**\n"
-        "   – Send `/stats` to view current status:\n\n"
-        "**Example**:\n"
-        "  • `/dl https://t.me/itsSmartDev/547`\n"
-        "  • `https://t.me/itsSmartDev/547`"
+        "➤ **Management**\n"
+        "   – `/killall` : Cancel all running tasks.\n"
+        "   – `/logs` : Get log file.\n"
+        "   – `/stats` : System status.\n"
     )
     
     markup = InlineKeyboardMarkup(
@@ -117,6 +116,9 @@ async def help_command(_, message: Message):
     await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
 
 
+# -------------------------------------------------------------------------------------
+# CORE DOWNLOAD LOGIC (With Cloning)
+# -------------------------------------------------------------------------------------
 async def handle_download(bot: Client, message: Message, post_url: str):
     async with download_semaphore:
         if "?" in post_url:
@@ -125,9 +127,37 @@ async def handle_download(bot: Client, message: Message, post_url: str):
         try:
             chat_id, message_id = getChatMsgID(post_url)
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+            
+            LOGGER(__name__).info(f"Processing URL: {post_url}")
 
-            LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
+            # --- 1. TRY DIRECT CLONE (Optimization) ---
+            try:
+                # Attempt to copy message directly. Fails if restricted or privacy blocks it.
+                if chat_message.media_group_id:
+                    await user.copy_media_group(
+                        chat_id=message.chat.id, 
+                        from_chat_id=chat_id, 
+                        message_id=message_id
+                    )
+                else:
+                    await user.copy_message(
+                        chat_id=message.chat.id, 
+                        from_chat_id=chat_id, 
+                        message_id=message_id
+                    )
+                
+                # If success, wait a bit and return (skip download)
+                LOGGER(__name__).info(f"Directly cloned message from {post_url}")
+                # Using FLOOD_WAIT_DELAY as the standard delay between actions
+                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
+                return 
 
+            except Exception as e:
+                # Clone failed (Restricted content?), falling back to download
+                LOGGER(__name__).info(f"Direct clone failed for {post_url}, falling back to download. Reason: {e}")
+            # ------------------------------------------
+
+            # --- 2. FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
                 file_size = (
                     chat_message.document.file_size
@@ -158,7 +188,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
             elif chat_message.media:
                 start_time = time()
-                progress_message = await message.reply("**📥 Downloading Progress...**")
+                progress_message = await message.reply(f"**📥 Downloading {message_id}...**")
 
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
@@ -211,9 +241,9 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 await message.reply("**No media or text found in the post URL.**")
 
         except (PeerIdInvalid, BadRequest, KeyError):
-            await message.reply("**Make sure the user client is part of the chat.**")
+            await message.reply(f"**Error processing {post_url}: User client likely not in chat.**")
         except Exception as e:
-            error_message = f"**❌ {str(e)}**"
+            error_message = f"**❌ Error at {post_url}: {str(e)}**"
             await message.reply(error_message)
             LOGGER(__name__).error(e)
 
@@ -223,42 +253,86 @@ async def download_media(bot: Client, message: Message):
     if len(message.command) < 2:
         await message.reply("**Provide a post URL after the /dl command.**")
         return
-
     post_url = message.command[1]
     await track_task(handle_download(bot, message, post_url))
 
 
-@bot.on_message(filters.command("bdl") & filters.private)
-async def download_range(bot: Client, message: Message):
-    args = message.text.split()
+# -------------------------------------------------------------------------------------
+# NEW /BATCH INTERACTIVE FLOW
+# -------------------------------------------------------------------------------------
+@bot.on_message(filters.command("batch") & filters.private)
+async def batch_command_start(bot: Client, message: Message):
+    # Set initial state
+    BATCH_STATES[message.from_user.id] = {'step': 'ask_link'}
+    await message.reply(
+        "🚀 **Batch Mode Initiated**\n\n"
+        "Please send the **Start Link** of the first post you want to download."
+    )
 
-    if len(args) != 3 or not all(arg.startswith("https://t.me/") for arg in args[1:]):
-        await message.reply(
-            "🚀 **Batch Download Process**\n"
-            "`/bdl start_link end_link`\n\n"
-            "💡 **Example:**\n"
-            "`/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`"
-        )
-        return
 
+# Generic Text Handler (Handles both single links AND batch conversation steps)
+@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall"]))
+async def handle_text_and_states(bot: Client, message: Message):
+    # 1. Check if user is in a Batch conversation
+    user_id = message.from_user.id
+    state = BATCH_STATES.get(user_id)
+
+    if state:
+        # --- Step 1: User sent the Link ---
+        if state['step'] == 'ask_link':
+            if not message.text.startswith("https://t.me/"):
+                await message.reply("❌ Invalid link. Please send a valid Telegram post link (e.g., https://t.me/channel/100).")
+                return
+            
+            # Store link and move to next step
+            BATCH_STATES[user_id]['start_link'] = message.text
+            BATCH_STATES[user_id]['step'] = 'ask_count'
+            await message.reply(
+                "✅ Link accepted.\n\n"
+                "**How many messages** do you want to process starting from there?\n"
+                "(Send a number, e.g., `100`)"
+            )
+            return
+
+        # --- Step 2: User sent the Count ---
+        elif state['step'] == 'ask_count':
+            if not message.text.isdigit():
+                await message.reply("❌ Please send a valid number.")
+                return
+            
+            count = int(message.text)
+            start_link = BATCH_STATES[user_id]['start_link']
+            
+            # Clean up state
+            del BATCH_STATES[user_id]
+            
+            # Execute Batch
+            await execute_batch_logic(bot, message, start_link, count)
+            return
+
+    # 2. If not in state, treat as a single download link (if it looks like a link)
+    if message.text and not message.text.startswith("/"):
+        await track_task(handle_download(bot, message, message.text))
+
+
+# Helper to run the batch loop
+async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
     try:
-        start_chat, start_id = getChatMsgID(args[1])
-        end_chat,   end_id   = getChatMsgID(args[2])
+        start_chat, start_id = getChatMsgID(start_link)
     except Exception as e:
-        return await message.reply(f"**❌ Error parsing links:\n{e}**")
+        return await message.reply(f"**❌ Error parsing start link:\n{e}**")
 
-    if start_chat != end_chat:
-        return await message.reply("**❌ Both links must be from the same channel.**")
-    if start_id > end_id:
-        return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
-
-    try:
-        await user.get_chat(start_chat)
-    except Exception:
-        pass
-
-    prefix = args[1].rsplit("/", 1)[0]
-    loading = await message.reply(f"📥 **Downloading posts {start_id}–{end_id}…**")
+    # Calculate End ID
+    end_id = start_id + count - 1
+    
+    prefix = start_link.rsplit("/", 1)[0]
+    
+    loading = await message.reply(
+        f"📥 **Starting Batch Process**\n"
+        f"From: `{start_id}`\n"
+        f"To: `{end_id}`\n"
+        f"Total: `{count}` posts"
+    )
 
     downloaded = skipped = failed = 0
     batch_tasks = []
@@ -267,6 +341,7 @@ async def download_range(bot: Client, message: Message):
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
         try:
+            # Check if message exists/is empty
             chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
             if not chat_msg:
                 skipped += 1
@@ -278,16 +353,18 @@ async def download_range(bot: Client, message: Message):
                 skipped += 1
                 continue
 
+            # Spawn task
             task = track_task(handle_download(bot, message, url))
             batch_tasks.append(task)
 
+            # Wait if batch size reached
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                 for result in results:
                     if isinstance(result, asyncio.CancelledError):
                         await loading.delete()
                         return await message.reply(
-                            f"**❌ Batch canceled** after downloading `{downloaded}` posts."
+                            f"**❌ Batch canceled** after processing `{downloaded}` posts."
                         )
                     elif isinstance(result, Exception):
                         failed += 1
@@ -296,12 +373,14 @@ async def download_range(bot: Client, message: Message):
                         downloaded += 1
 
                 batch_tasks.clear()
+                # Flood wait to be safe
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
         except Exception as e:
             failed += 1
             LOGGER(__name__).error(f"Error at {url}: {e}")
 
+    # Process remaining tasks
     if batch_tasks:
         results = await asyncio.gather(*batch_tasks, return_exceptions=True)
         for result in results:
@@ -314,16 +393,10 @@ async def download_range(bot: Client, message: Message):
     await message.reply(
         "**✅ Batch Process Complete!**\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Downloaded** : `{downloaded}` post(s)\n"
-        f"⏭️ **Skipped** : `{skipped}` (no content)\n"
-        f"❌ **Failed** : `{failed}` error(s)"
+        f"📥 **Processed** : `{downloaded}`\n"
+        f"⏭️ **Skipped** : `{skipped}`\n"
+        f"❌ **Failed** : `{failed}`"
     )
-
-
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "stats", "logs", "killall"]))
-async def handle_any_message(bot: Client, message: Message):
-    if message.text and not message.text.startswith("/"):
-        await track_task(handle_download(bot, message, message.text))
 
 
 @bot.on_message(filters.command("stats") & filters.private)
@@ -335,25 +408,15 @@ async def stats(_, message: Message):
     free = get_readable_file_size(free)
     sent = get_readable_file_size(psutil.net_io_counters().bytes_sent)
     recv = get_readable_file_size(psutil.net_io_counters().bytes_recv)
-    cpuUsage = psutil.cpu_percent(interval=0.5)
-    memory = psutil.virtual_memory().percent
-    disk = psutil.disk_usage("/").percent
-    process = psutil.Process(os.getpid())
-
-    stats = (
-        "**≧◉◡◉≦ Bot is Up and Running successfully.**\n\n"
-        f"**➜ Bot Uptime:** `{currentTime}`\n"
-        f"**➜ Total Disk Space:** `{total}`\n"
-        f"**➜ Used:** `{used}`\n"
-        f"**➜ Free:** `{free}`\n"
-        f"**➜ Memory Usage:** `{round(process.memory_info()[0] / 1024**2)} MiB`\n\n"
+    
+    stats_msg = (
+        "**Bot Status**\n\n"
+        f"**➜ Uptime:** `{currentTime}`\n"
+        f"**➜ Disk Free:** `{free}`\n"
         f"**➜ Upload:** `{sent}`\n"
-        f"**➜ Download:** `{recv}`\n\n"
-        f"**➜ CPU:** `{cpuUsage}%` | "
-        f"**➜ RAM:** `{memory}%` | "
-        f"**➜ DISK:** `{disk}%`"
+        f"**➜ Download:** `{recv}`"
     )
-    await message.reply(stats)
+    await message.reply(stats_msg)
 
 
 @bot.on_message(filters.command("logs") & filters.private)
@@ -367,6 +430,10 @@ async def logs(_, message: Message):
 @bot.on_message(filters.command("killall") & filters.private)
 async def cancel_all_tasks(_, message: Message):
     cancelled = 0
+    # Clear state if any
+    if message.from_user.id in BATCH_STATES:
+        del BATCH_STATES[message.from_user.id]
+        
     for task in list(RUNNING_TASKS):
         if not task.done():
             task.cancel()
