@@ -8,16 +8,15 @@ import asyncio
 from time import time
 from aiohttp import web
 
-from pyleaves import Leaves
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait, RPCError
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 from helpers.utils import (
     processMediaGroup,
-    progressArgs,
-    send_media
+    send_media,
+    progress_bar
 )
 
 from helpers.files import (
@@ -60,7 +59,7 @@ user = Client(
 
 RUNNING_TASKS = set()
 download_semaphore = None
-BATCH_STATES = {}  # Stores state for user interactions: {user_id: {'step': '...', 'data': ...}}
+BATCH_STATES = {}  
 
 def track_task(coro):
     task = asyncio.create_task(coro)
@@ -70,21 +69,15 @@ def track_task(coro):
     task.add_done_callback(_remove)
     return task
 
-
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, message: Message):
     welcome_text = (
         "👋 **Welcome to Media Downloader Bot!**\n\n"
         "I can grab photos, videos, audio, and documents from any Telegram post.\n"
-        "Just send me a link (paste it directly or use `/dl <link>`),\n"
-        "or reply to a message with `/dl`.\n\n"
         "**New Feature:**\n"
-        "Use `/batch` to clone/download multiple messages easily!\n\n"
-        "ℹ️ Use `/help` to view all commands and examples.\n"
-        "🔒 Make sure the user client is part of the chat.\n\n"
-        "Ready? Send me a Telegram post link!"
+        "Use `/batch` to clone/download multiple messages easily!\n"
+        f"⚡ Parallel processing: **{PyroConf.MAX_CONCURRENT_DOWNLOADS} files at once**\n"
     )
-
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
     )
@@ -100,26 +93,21 @@ async def help_command(_, message: Message):
         "➤ **Batch Process (Simple)**\n"
         "   1. Send `/batch`\n"
         "   2. Send the **Start Link**\n"
-        "   3. Send the **Number of Messages** (e.g., 100)\n"
-        "   The bot will calculate the range and process them.\n\n"
-        "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat.\n\n"
+        "   3. Send the **Number of Messages**\n"
+        "   The bot will process 3 files at a time.\n\n"
         "➤ **Management**\n"
         "   – `/killall` : Cancel all running tasks.\n"
         "   – `/logs` : Get log file.\n"
         "   – `/stats` : System status.\n"
     )
-    
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
     )
     await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
 
 
-# -------------------------------------------------------------------------------------
-# CORE DOWNLOAD LOGIC (With Cloning)
-# -------------------------------------------------------------------------------------
 async def handle_download(bot: Client, message: Message, post_url: str):
+    # SEMAPHORE: Controls Parallelism (e.g., only 3 tasks enter here at once)
     async with download_semaphore:
         if "?" in post_url:
             post_url = post_url.split("?", 1)[0]
@@ -132,7 +120,6 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
             # --- 1. TRY DIRECT CLONE (Optimization) ---
             try:
-                # Attempt to copy message directly. Fails if restricted or privacy blocks it.
                 if chat_message.media_group_id:
                     await user.copy_media_group(
                         chat_id=message.chat.id, 
@@ -146,16 +133,22 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                         message_id=message_id
                     )
                 
-                # If success, wait a bit and return (skip download)
                 LOGGER(__name__).info(f"Directly cloned message from {post_url}")
-                # Using FLOOD_WAIT_DELAY as the standard delay between actions
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
                 return 
 
+            except FloodWait as fw:
+                LOGGER(__name__).warning(f"FloodWait of {fw.value}s during clone. Sleeping...")
+                await asyncio.sleep(fw.value)
+            
+            except RPCError as e:
+                LOGGER(__name__).info(f"Direct clone not allowed, switching to download. Info: {e}")
+                if "/batch" not in (message.text or ""):
+                     temp_msg = await message.reply("⚠️ **Direct copy restricted. Downloading manually...**")
+                     asyncio.create_task(delete_after(temp_msg, 5))
+
             except Exception as e:
-                # Clone failed (Restricted content?), falling back to download
-                LOGGER(__name__).info(f"Direct clone failed for {post_url}, falling back to download. Reason: {e}")
-            # ------------------------------------------
+                LOGGER(__name__).warning(f"Generic error during clone: {e}")
 
             # --- 2. FALLBACK: DOWNLOAD & UPLOAD ---
             if chat_message.document or chat_message.video or chat_message.audio:
@@ -179,26 +172,21 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 chat_message.text or "", chat_message.entities
             )
 
-            if chat_message.media_group_id:
-                if not await processMediaGroup(chat_message, bot, message):
-                    await message.reply(
-                        "**Could not extract any valid media from the media group.**"
-                    )
-                return
-
-            elif chat_message.media:
+            if chat_message.media:
                 start_time = time()
+                # Create a UNIQUE progress message for this task
                 progress_message = await message.reply(f"**📥 Downloading {message_id}...**")
 
                 filename = get_file_name(message_id, chat_message)
                 download_path = get_download_path(message.id, filename)
 
+                # Download Interval: 20s
+                DOWNLOAD_INTERVAL = 20
+
                 media_path = await chat_message.download(
                     file_name=download_path,
-                    progress=Leaves.progress_for_pyrogram,
-                    progress_args=progressArgs(
-                        "📥 Downloading Progress", progress_message, start_time
-                    ),
+                    progress=progress_bar,
+                    progress_args=(progress_message, start_time, "📥 Downloading", DOWNLOAD_INTERVAL),
                 )
 
                 if not media_path or not os.path.exists(media_path):
@@ -210,8 +198,6 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                     await progress_message.edit("**❌ Download failed: File is empty**")
                     cleanup_download(media_path)
                     return
-
-                LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
 
                 media_type = (
                     "photo"
@@ -247,6 +233,13 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             await message.reply(error_message)
             LOGGER(__name__).error(e)
 
+async def delete_after(message, delay):
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except:
+        pass
+
 
 @bot.on_message(filters.command("dl") & filters.private)
 async def download_media(bot: Client, message: Message):
@@ -257,202 +250,103 @@ async def download_media(bot: Client, message: Message):
     await track_task(handle_download(bot, message, post_url))
 
 
-# -------------------------------------------------------------------------------------
-# NEW /BATCH INTERACTIVE FLOW
-# -------------------------------------------------------------------------------------
 @bot.on_message(filters.command("batch") & filters.private)
 async def batch_command_start(bot: Client, message: Message):
-    # Set initial state
     BATCH_STATES[message.from_user.id] = {'step': 'ask_link'}
-    await message.reply(
-        "🚀 **Batch Mode Initiated**\n\n"
-        "Please send the **Start Link** of the first post you want to download."
-    )
+    await message.reply("🚀 **Batch Mode**\nPlease send the **Start Link**.")
 
 
-# Generic Text Handler (Handles both single links AND batch conversation steps)
 @bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "batch", "stats", "logs", "killall"]))
 async def handle_text_and_states(bot: Client, message: Message):
-    # 1. Check if user is in a Batch conversation
     user_id = message.from_user.id
     state = BATCH_STATES.get(user_id)
 
     if state:
-        # --- Step 1: User sent the Link ---
         if state['step'] == 'ask_link':
             if not message.text.startswith("https://t.me/"):
-                await message.reply("❌ Invalid link. Please send a valid Telegram post link (e.g., https://t.me/channel/100).")
+                await message.reply("❌ Invalid link.")
                 return
             
-            # Store link and move to next step
             BATCH_STATES[user_id]['start_link'] = message.text
             BATCH_STATES[user_id]['step'] = 'ask_count'
-            await message.reply(
-                "✅ Link accepted.\n\n"
-                "**How many messages** do you want to process starting from there?\n"
-                "(Send a number, e.g., `100`)"
-            )
+            await message.reply("✅ Link accepted.\n**How many messages?** (e.g., `100`)")
             return
 
-        # --- Step 2: User sent the Count ---
         elif state['step'] == 'ask_count':
             if not message.text.isdigit():
-                await message.reply("❌ Please send a valid number.")
+                await message.reply("❌ Please send a number.")
                 return
             
             count = int(message.text)
             start_link = BATCH_STATES[user_id]['start_link']
-            
-            # Clean up state
             del BATCH_STATES[user_id]
             
-            # Execute Batch
             await execute_batch_logic(bot, message, start_link, count)
             return
 
-    # 2. If not in state, treat as a single download link (if it looks like a link)
     if message.text and not message.text.startswith("/"):
         await track_task(handle_download(bot, message, message.text))
 
 
-# Helper to run the batch loop
 async def execute_batch_logic(bot: Client, message: Message, start_link: str, count: int):
     try:
         start_chat, start_id = getChatMsgID(start_link)
     except Exception as e:
         return await message.reply(f"**❌ Error parsing start link:\n{e}**")
 
-    # Calculate End ID
     end_id = start_id + count - 1
-    
     prefix = start_link.rsplit("/", 1)[0]
     
     loading = await message.reply(
-        f"📥 **Starting Batch Process**\n"
-        f"From: `{start_id}`\n"
-        f"To: `{end_id}`\n"
-        f"Total: `{count}` posts"
+        f"📥 **Batch Started**\nRange: `{start_id}` to `{end_id}`\n"
+        f"Parallel Downloads: `{PyroConf.MAX_CONCURRENT_DOWNLOADS}`"
     )
 
     downloaded = skipped = failed = 0
     batch_tasks = []
-    BATCH_SIZE = PyroConf.BATCH_SIZE
+    # BATCH_SIZE is chunk size; Semaphore controls active downloads
+    BATCH_SIZE = PyroConf.BATCH_SIZE 
 
     for msg_id in range(start_id, end_id + 1):
         url = f"{prefix}/{msg_id}"
         try:
-            # Check if message exists/is empty
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
-            if not chat_msg:
-                skipped += 1
-                continue
-
-            has_media = bool(chat_msg.media_group_id or chat_msg.media)
-            has_text  = bool(chat_msg.text or chat_msg.caption)
-            if not (has_media or has_text):
-                skipped += 1
-                continue
-
-            # Spawn task
+            # We create a task for every message in sequence
             task = track_task(handle_download(bot, message, url))
             batch_tasks.append(task)
 
-            # Wait if batch size reached
+            # Process in chunks to avoid memory overload
             if len(batch_tasks) >= BATCH_SIZE:
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
                 for result in results:
-                    if isinstance(result, asyncio.CancelledError):
-                        await loading.delete()
-                        return await message.reply(
-                            f"**❌ Batch canceled** after processing `{downloaded}` posts."
-                        )
-                    elif isinstance(result, Exception):
+                    if isinstance(result, Exception):
                         failed += 1
-                        LOGGER(__name__).error(f"Error: {result}")
+                        LOGGER(__name__).error(f"Batch Error: {result}")
                     else:
                         downloaded += 1
 
                 batch_tasks.clear()
-                # Flood wait to be safe
                 await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
 
         except Exception as e:
             failed += 1
-            LOGGER(__name__).error(f"Error at {url}: {e}")
 
-    # Process remaining tasks
     if batch_tasks:
-        results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                failed += 1
-            else:
-                downloaded += 1
+        await asyncio.gather(*batch_tasks, return_exceptions=True)
+        downloaded += len(batch_tasks)
 
     await loading.delete()
-    await message.reply(
-        "**✅ Batch Process Complete!**\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Processed** : `{downloaded}`\n"
-        f"⏭️ **Skipped** : `{skipped}`\n"
-        f"❌ **Failed** : `{failed}`"
-    )
-
-
-@bot.on_message(filters.command("stats") & filters.private)
-async def stats(_, message: Message):
-    currentTime = get_readable_time(time() - PyroConf.BOT_START_TIME)
-    total, used, free = shutil.disk_usage(".")
-    total = get_readable_file_size(total)
-    used = get_readable_file_size(used)
-    free = get_readable_file_size(free)
-    sent = get_readable_file_size(psutil.net_io_counters().bytes_sent)
-    recv = get_readable_file_size(psutil.net_io_counters().bytes_recv)
-    
-    stats_msg = (
-        "**Bot Status**\n\n"
-        f"**➜ Uptime:** `{currentTime}`\n"
-        f"**➜ Disk Free:** `{free}`\n"
-        f"**➜ Upload:** `{sent}`\n"
-        f"**➜ Download:** `{recv}`"
-    )
-    await message.reply(stats_msg)
-
-
-@bot.on_message(filters.command("logs") & filters.private)
-async def logs(_, message: Message):
-    if os.path.exists("logs.txt"):
-        await message.reply_document(document="logs.txt", caption="**Logs**")
-    else:
-        await message.reply("**Not exists**")
-
-
-@bot.on_message(filters.command("killall") & filters.private)
-async def cancel_all_tasks(_, message: Message):
-    cancelled = 0
-    # Clear state if any
-    if message.from_user.id in BATCH_STATES:
-        del BATCH_STATES[message.from_user.id]
-        
-    for task in list(RUNNING_TASKS):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-    await message.reply(f"**Cancelled {cancelled} running task(s).**")
+    await message.reply("**✅ Batch Process Complete!**")
 
 
 async def initialize():
     global download_semaphore
+    # This ensures only 3 downloads run at once
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
 
 
-# -------------------------------------------------------------------------------------
-# Dummy Web Server for Render
-# -------------------------------------------------------------------------------------
 async def web_server():
     async def handle(request):
         return web.Response(text="Bot is running!")
-
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
@@ -462,27 +356,14 @@ async def web_server():
     LOGGER(__name__).info(f"Web server started on port {os.getenv('PORT', 8080)}")
 
 
-# -------------------------------------------------------------------------------------
-# MAIN EXECUTION
-# -------------------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         LOGGER(__name__).info("Bot Started!")
         loop = asyncio.get_event_loop()
-        
-        # Initialize semaphore
         loop.run_until_complete(initialize())
-        
-        # Start the User Client
-        # FIX: Directly call start() because it is synchronous in this library version.
         user.start()
-        
-        # Start the Dummy Web Server
         loop.run_until_complete(web_server())
-        
-        # Start the Bot Client
         bot.run()
-        
     except KeyboardInterrupt:
         pass
     except Exception as err:
