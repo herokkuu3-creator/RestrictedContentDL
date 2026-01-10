@@ -6,7 +6,7 @@ import shutil
 import psutil
 import asyncio
 from time import time
-from aiohttp import web  # <--- Added for Render Support
+from aiohttp import web
 
 from pyleaves import Leaves
 from pyrogram.enums import ParseMode
@@ -45,7 +45,7 @@ bot = Client(
     bot_token=PyroConf.BOT_TOKEN,
     workers=100,
     parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
+    max_concurrent_transmissions=1,
     sleep_threshold=30,
 )
 
@@ -54,7 +54,7 @@ user = Client(
     "user_session",
     workers=100,
     session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
+    max_concurrent_transmissions=1,
     sleep_threshold=30,
 )
 
@@ -380,7 +380,7 @@ async def initialize():
 
 
 # -------------------------------------------------------------------------------------
-# NEW FUNCTION: Dummy Web Server for Render
+# Dummy Web Server for Render
 # -------------------------------------------------------------------------------------
 async def web_server():
     async def handle(request):
@@ -390,7 +390,6 @@ async def web_server():
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render provides the PORT environment variable
     site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080)))
     await site.start()
     LOGGER(__name__).info(f"Web server started on port {os.getenv('PORT', 8080)}")
@@ -408,13 +407,13 @@ if __name__ == "__main__":
         loop.run_until_complete(initialize())
         
         # Start the User Client
-        # Note: user.start() is async in Pyrogram, so we strictly await it
-        loop.run_until_complete(user.start())
+        # FIX: Directly call start() because it is synchronous in this library version.
+        user.start()
         
         # Start the Dummy Web Server
         loop.run_until_complete(web_server())
         
-        # Start the Bot Client (This blocks and keeps the script running)
+        # Start the Bot Client
         bot.run()
         
     except KeyboardInterrupt:
