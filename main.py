@@ -6,6 +6,7 @@ import shutil
 import psutil
 import asyncio
 from time import time
+from aiohttp import web  # <--- Added for Render Support
 
 from pyleaves import Leaves
 from pyrogram.enums import ParseMode
@@ -314,8 +315,8 @@ async def download_range(bot: Client, message: Message):
         "**✅ Batch Process Complete!**\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         f"📥 **Downloaded** : `{downloaded}` post(s)\n"
-        f"⏭️ **Skipped**    : `{skipped}` (no content)\n"
-        f"❌ **Failed**     : `{failed}` error(s)"
+        f"⏭️ **Skipped** : `{skipped}` (no content)\n"
+        f"❌ **Failed** : `{failed}` error(s)"
     )
 
 
@@ -377,12 +378,45 @@ async def initialize():
     global download_semaphore
     download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
 
+
+# -------------------------------------------------------------------------------------
+# NEW FUNCTION: Dummy Web Server for Render
+# -------------------------------------------------------------------------------------
+async def web_server():
+    async def handle(request):
+        return web.Response(text="Bot is running!")
+
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render provides the PORT environment variable
+    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080)))
+    await site.start()
+    LOGGER(__name__).info(f"Web server started on port {os.getenv('PORT', 8080)}")
+
+
+# -------------------------------------------------------------------------------------
+# MAIN EXECUTION
+# -------------------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         LOGGER(__name__).info("Bot Started!")
-        asyncio.get_event_loop().run_until_complete(initialize())
-        user.start()
+        loop = asyncio.get_event_loop()
+        
+        # Initialize semaphore
+        loop.run_until_complete(initialize())
+        
+        # Start the User Client
+        # Note: user.start() is async in Pyrogram, so we strictly await it
+        loop.run_until_complete(user.start())
+        
+        # Start the Dummy Web Server
+        loop.run_until_complete(web_server())
+        
+        # Start the Bot Client (This blocks and keeps the script running)
         bot.run()
+        
     except KeyboardInterrupt:
         pass
     except Exception as err:
