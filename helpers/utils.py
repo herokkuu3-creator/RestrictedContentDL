@@ -3,14 +3,15 @@
 
 import os
 import asyncio
-from time import time
-from PIL import Image
-from logger import LOGGER
+import time
+import math
 from typing import Optional
 from asyncio.subprocess import PIPE
 from asyncio import create_subprocess_exec, create_subprocess_shell, wait_for
 
-from pyleaves import Leaves
+# Removed Pyleaves import
+# from pyleaves import Leaves 
+
 from pyrogram.parser import Parser
 from pyrogram.utils import get_channel_id
 from pyrogram.types import (
@@ -20,22 +21,31 @@ from pyrogram.types import (
     InputMediaAudio,
     Voice,
 )
+from pyrogram.errors import MessageNotModified
 
 from helpers.files import (
     fileSizeLimit,
-    cleanup_download
+    cleanup_download,
+    get_readable_file_size, # Added import
+    get_readable_time       # Added import
 )
 
 from helpers.msg import (
     get_parsed_msg
 )
 
+from logger import LOGGER
+
 # Progress bar template
 PROGRESS_BAR = """
 Percentage: {percentage:.2f}% | {current}/{total}
 Speed: {speed}/s
-Estimated Time Left: {est_time} seconds
+Estimated Time Left: {est_time}
 """
+
+# Global cache to track the last update time for each message
+# Format: {message_id: last_update_timestamp}
+PROGRESS_CACHE = {}
 
 async def cmd_exec(cmd, shell=False):
     if shell:
@@ -126,7 +136,80 @@ async def get_video_thumbnail(video_file, duration):
 
 # Generate progress bar for downloading/uploading
 def progressArgs(action: str, progress_message, start_time):
+    # We pass the same args, but our custom function will use them differently
     return (action, progress_message, start_time, PROGRESS_BAR, "▓", "░")
+
+
+# --- NEW CUSTOM PROGRESS FUNCTION ---
+async def progress_for_pyrogram(current, total, action, message, start_time, template, finish, unfinish):
+    now = time.time()
+    
+    # 1. Logic for Update Interval
+    is_download = "Download" in action
+    size_mb = total / (1024 * 1024)
+    
+    if is_download:
+        # If < 500MB update every 20s, else 25s
+        interval = 20 if size_mb < 500 else 25
+    else:
+        # If < 300MB update every 5s, else 9s
+        interval = 5 if size_mb < 300 else 9
+
+    last_update = PROGRESS_CACHE.get(message.id, 0)
+    
+    # Check if we should update (always update if finished, otherwise check interval)
+    if current != total and (now - last_update) < interval:
+        return
+
+    # Update cache
+    PROGRESS_CACHE[message.id] = now
+    
+    # 2. Calculate Stats
+    percentage = (current * 100) / total
+    
+    # Use Average Speed (Total Bytes / Total Time) for stable ETL
+    elapsed_time = now - start_time
+    if elapsed_time <= 0: elapsed_time = 0.1 # avoid div by zero
+    
+    speed = current / elapsed_time
+    speed_text = f"{get_readable_file_size(speed)}/s"
+    
+    remaining_bytes = total - current
+    if speed > 0:
+        etl_seconds = remaining_bytes / speed
+        etl_text = get_readable_time(int(etl_seconds))
+    else:
+        etl_text = "0s"
+    
+    # 3. Generate Bar
+    bar_len = 20
+    filled = int(percentage / 100 * bar_len)
+    bar = finish * filled + unfinish * (bar_len - filled)
+    
+    current_size = get_readable_file_size(current)
+    total_size = get_readable_file_size(total)
+    
+    # Format Text
+    text = template.format(
+        percentage=percentage,
+        current=current_size,
+        total=total_size,
+        speed=speed_text,
+        est_time=etl_text
+    )
+    
+    # 4. Edit Message
+    try:
+        await message.edit(f"**{action}**\n{bar}\n{text}")
+    except MessageNotModified:
+        pass
+    except Exception as e:
+        LOGGER(__name__).error(f"Progress Error: {e}")
+        
+    # Cleanup cache if finished
+    if current == total:
+        if message.id in PROGRESS_CACHE:
+            del PROGRESS_CACHE[message.id]
 
 
 async def send_media(
@@ -149,7 +232,7 @@ async def send_media(
             chat_id=target_chat_id,
             photo=media_path,
             caption=caption or "",
-            progress=Leaves.progress_for_pyrogram,
+            progress=progress_for_pyrogram, # UPDATED
             progress_args=progress_args,
         )
     elif media_type == "video":
@@ -174,7 +257,7 @@ async def send_media(
             thumb=thumb,
             caption=caption or "",
             supports_streaming=True,
-            progress=Leaves.progress_for_pyrogram,
+            progress=progress_for_pyrogram, # UPDATED
             progress_args=progress_args,
         )
     elif media_type == "audio":
@@ -186,7 +269,7 @@ async def send_media(
             performer=artist,
             title=title,
             caption=caption or "",
-            progress=Leaves.progress_for_pyrogram,
+            progress=progress_for_pyrogram, # UPDATED
             progress_args=progress_args,
         )
     elif media_type == "document":
@@ -194,7 +277,7 @@ async def send_media(
             chat_id=target_chat_id,
             document=media_path,
             caption=caption or "",
-            progress=Leaves.progress_for_pyrogram,
+            progress=progress_for_pyrogram, # UPDATED
             progress_args=progress_args,
         )
 
@@ -202,7 +285,7 @@ async def send_media(
 async def download_single_media(msg, progress_message, start_time):
     try:
         media_path = await msg.download(
-            progress=Leaves.progress_for_pyrogram,
+            progress=progress_for_pyrogram, # UPDATED
             progress_args=progressArgs(
                 "📥 Downloading Progress", progress_message, start_time
             ),
@@ -237,7 +320,13 @@ async def processMediaGroup(chat_message, bot, message, destination_chat_id=None
     # Target chat determination
     target_chat_id = destination_chat_id if destination_chat_id else message.chat.id
 
-    start_time = time()
+    start_time = time.time() # Fixed: use time.time() instead of time() if import is not 'from time import time'
+    # Actually utils.py does 'import time' and 'from time import time'.
+    # I'll stick to 'time.time()' or just 'time()' if imported. 
+    # In this file imports are: 'import time' AND 'from time import time'. 
+    # Let's use `time.time()` to be safe as `time` module is imported.
+    start_time = time.time()
+    
     progress_message = await message.reply("📥 Downloading media group...")
     LOGGER(__name__).info(
         f"Downloading media group with {len(media_group_messages)} items..."
