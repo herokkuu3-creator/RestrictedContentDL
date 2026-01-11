@@ -8,7 +8,9 @@ import asyncio
 from time import time
 from aiohttp import web
 
-from pyleaves import Leaves
+# Removed pyleaves import
+# from pyleaves import Leaves
+
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest
@@ -17,7 +19,8 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from helpers.utils import (
     processMediaGroup,
     progressArgs,
-    send_media
+    send_media,
+    progress_for_pyrogram # Added this import
 )
 
 from helpers.files import (
@@ -320,7 +323,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
                 media_path = await chat_message.download(
                     file_name=download_path,
-                    progress=Leaves.progress_for_pyrogram,
+                    progress=progress_for_pyrogram, # UPDATED: Use custom progress
                     progress_args=progressArgs(
                         "📥 Downloading Progress", progress_message, start_time
                     ),
