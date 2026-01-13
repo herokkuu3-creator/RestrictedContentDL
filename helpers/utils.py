@@ -1,5 +1,3 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
 
 import os
 import asyncio
@@ -201,6 +199,7 @@ async def progress_for_pyrogram(current, total, action, message, start_time, tem
     
     # 4. Edit Message
     try:
+        # action string (which now contains ID) is printed as the bold header
         await message.edit(f"**{action}**\n{bar}\n{text}")
     except MessageNotModified:
         pass
@@ -223,64 +222,73 @@ async def send_media(
 
     if not await fileSizeLimit(file_size, message, "upload"):
         return
+    
+    # LOGIC CHANGE: Check if we have a progress message. If not, send silently.
+    if progress_message:
+        progress_args = progressArgs("📥 Uploading Progress", progress_message, start_time)
+        progress_func = progress_for_pyrogram
+    else:
+        progress_args = None
+        progress_func = None
 
-    progress_args = progressArgs("📥 Uploading Progress", progress_message, start_time)
     LOGGER(__name__).info(f"Uploading media: {media_path} ({media_type}) to {target_chat_id}")
 
     # Note: We use bot.send_* methods instead of message.reply_* to support custom destinations
-    if media_type == "photo":
-        await bot.send_photo(
-            chat_id=target_chat_id,
-            photo=media_path,
-            caption=caption or "",
-            progress=progress_for_pyrogram, # UPDATED
-            progress_args=progress_args,
-        )
-    elif media_type == "video":
-        duration, _, _, width, height = await get_media_info(media_path)
+    # Common args for all send methods
+    send_kwargs = {
+        "caption": caption or "",
+        "progress": progress_func,
+        "progress_args": progress_args
+    }
 
-        if not duration or duration == 0:
-            duration = 0
-            LOGGER(__name__).warning(f"Could not extract duration for {media_path}")
+    try:
+        if media_type == "photo":
+            await bot.send_photo(
+                chat_id=target_chat_id,
+                photo=media_path,
+                **send_kwargs
+            )
+        elif media_type == "video":
+            duration, _, _, width, height = await get_media_info(media_path)
 
-        if not width or not height:
-            width = 640
-            height = 480
+            if not duration or duration == 0:
+                duration = 0
+                LOGGER(__name__).warning(f"Could not extract duration for {media_path}")
 
-        thumb = await get_video_thumbnail(media_path, duration)
+            if not width or not height:
+                width = 640
+                height = 480
 
-        await bot.send_video(
-            chat_id=target_chat_id,
-            video=media_path,
-            duration=duration,
-            width=width,
-            height=height,
-            thumb=thumb,
-            caption=caption or "",
-            supports_streaming=True,
-            progress=progress_for_pyrogram, # UPDATED
-            progress_args=progress_args,
-        )
-    elif media_type == "audio":
-        duration, artist, title, _, _ = await get_media_info(media_path)
-        await bot.send_audio(
-            chat_id=target_chat_id,
-            audio=media_path,
-            duration=duration,
-            performer=artist,
-            title=title,
-            caption=caption or "",
-            progress=progress_for_pyrogram, # UPDATED
-            progress_args=progress_args,
-        )
-    elif media_type == "document":
-        await bot.send_document(
-            chat_id=target_chat_id,
-            document=media_path,
-            caption=caption or "",
-            progress=progress_for_pyrogram, # UPDATED
-            progress_args=progress_args,
-        )
+            thumb = await get_video_thumbnail(media_path, duration)
+
+            await bot.send_video(
+                chat_id=target_chat_id,
+                video=media_path,
+                duration=duration,
+                width=width,
+                height=height,
+                thumb=thumb,
+                supports_streaming=True,
+                **send_kwargs
+            )
+        elif media_type == "audio":
+            duration, artist, title, _, _ = await get_media_info(media_path)
+            await bot.send_audio(
+                chat_id=target_chat_id,
+                audio=media_path,
+                duration=duration,
+                performer=artist,
+                title=title,
+                **send_kwargs
+            )
+        elif media_type == "document":
+            await bot.send_document(
+                chat_id=target_chat_id,
+                document=media_path,
+                **send_kwargs
+            )
+    except Exception as e:
+        LOGGER(__name__).error(f"Error sending media: {e}")
 
 
 async def download_single_media(msg, progress_message, start_time):
@@ -406,3 +414,5 @@ async def processMediaGroup(chat_message, bot, message, destination_chat_id=None
     for path in invalid_paths:
         cleanup_download(path)
     return False
+
+}
