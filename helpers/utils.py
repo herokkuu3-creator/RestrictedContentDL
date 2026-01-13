@@ -148,12 +148,13 @@ async def progress_for_pyrogram(current, total, action, message, start_time, tem
     is_download = "Download" in action
     size_mb = total / (1024 * 1024)
     
+    # NEW LOGIC: High intervals to prevent FloodWait
     if is_download:
-        # If < 500MB update every 20s, else 25s
-        interval = 20 if size_mb < 500 else 25
+        # Download: 25s if < 500MB, else 35s
+        interval = 25 if size_mb < 500 else 35
     else:
-        # If < 300MB update every 5s, else 9s
-        interval = 5 if size_mb < 300 else 9
+        # Upload: 15s if < 500MB, else 25s
+        interval = 15 if size_mb < 500 else 25
 
     last_update = PROGRESS_CACHE.get(message.id, 0)
     
@@ -320,14 +321,9 @@ async def processMediaGroup(chat_message, bot, message, destination_chat_id=None
     # Target chat determination
     target_chat_id = destination_chat_id if destination_chat_id else message.chat.id
 
-    start_time = time.time() # Fixed: use time.time() instead of time() if import is not 'from time import time'
-    # Actually utils.py does 'import time' and 'from time import time'.
-    # I'll stick to 'time.time()' or just 'time()' if imported. 
-    # In this file imports are: 'import time' AND 'from time import time'. 
-    # Let's use `time.time()` to be safe as `time` module is imported.
     start_time = time.time()
     
-    progress_message = await message.reply("📥 Downloading media group...")
+    progress_message = await message.reply(f"📥 Downloading media group... ({len(media_group_messages)} files)")
     LOGGER(__name__).info(
         f"Downloading media group with {len(media_group_messages)} items..."
     )
