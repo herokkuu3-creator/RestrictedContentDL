@@ -597,11 +597,14 @@ async def logs(_, message: Message):
 
 @bot.on_callback_query(filters.regex("^refresh_progress$"))
 async def refresh_progress_callback(_, query):
-    refreshed = await refresh_progress_message(query.message)
+    refreshed, remaining = await refresh_progress_message(query.message)
     if refreshed:
         await query.answer("Progress refreshed.")
     else:
-        await query.answer("No active progress for this message.", show_alert=True)
+        if remaining:
+            await query.answer(f"Heyy!! Wait for {remaining} sec", show_alert=True)
+        else:
+            await query.answer("No active progress for this message.", show_alert=True)
 
 
 @bot.on_message(filters.command("killall") & filters.private)
